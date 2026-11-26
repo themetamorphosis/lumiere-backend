@@ -51,6 +51,6 @@ async def get_current_user(
     result = await db.execute(select(models.User).filter(models.User.email == token_data.email))
     user = result.scalars().first()
 
-    if user is None:
+    if user is None or payload.get("auth_version") != user.auth_version:
         raise credentials_exception
     return user

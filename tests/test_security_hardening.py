@@ -7,7 +7,8 @@ against the pre-fix code for the documented reason.
 import uuid
 
 import pytest
-from httpx import AsyncClient
+import respx
+from httpx import AsyncClient, Response
 
 from app.core import security
 from app.utils.file_validator import extension_for_content, sanitize_extension
@@ -215,8 +216,12 @@ async def test_discover_rejects_injected_sort_by(client: AsyncClient):
     assert res.status_code == 422
 
 
+@respx.mock
 @pytest.mark.asyncio
 async def test_discover_accepts_known_sort_by(client: AsyncClient):
+    respx.get("https://api.themoviedb.org/3/discover/movie").mock(
+        return_value=Response(200, json={"results": []})
+    )
     res = await client.get(
         "/api/v1/media/discover", params={"type": "movie", "sort_by": "vote_average.desc"}
     )

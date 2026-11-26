@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import field_validator, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 
 
 MIN_SECRET_KEY_LENGTH = 32
@@ -40,6 +40,13 @@ class Settings(BaseSettings):
     TMDB_API_KEY: str = ""
 
     UPLOAD_DIR: str = ""
+
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_FROM: str = ""
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: SecretStr = SecretStr("")
+    SMTP_STARTTLS: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -83,6 +90,9 @@ class Settings(BaseSettings):
         """
         if self.ENVIRONMENT.lower() not in HARDENED_ENVIRONMENTS:
             return self
+
+        if self.SMTP_HOST and (not self.SMTP_STARTTLS or not self.FRONTEND_URL.startswith("https://")):
+            raise ValueError("Account recovery requires SMTP STARTTLS and an HTTPS FRONTEND_URL")
 
         lowered = self.SECRET_KEY.strip().lower()
         for marker in PLACEHOLDER_SECRET_MARKERS:

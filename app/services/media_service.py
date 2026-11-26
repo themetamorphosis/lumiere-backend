@@ -361,12 +361,33 @@ async def fetch_tv_runtime(title: str, year: Optional[int]) -> Optional[int]:
     d_req = await client.get(f"https://api.themoviedb.org/3/tv/{show_id}?api_key={settings.TMDB_API_KEY}")
     if d_req.status_code != 200:
         return None
-    info = d_req.json()
+    return _total_tv_runtime(d_req.json())
+
+
+def _total_tv_runtime(info: dict) -> int:
     ep_runtimes = info.get("episode_run_time") or []
     last_episode = info.get("last_episode_to_air") or {}
     ep_runtime = sum(ep_runtimes) / len(ep_runtimes) if ep_runtimes else (last_episode.get("runtime") or 25)
     total_eps = info.get("number_of_episodes") or 1
     return int(round(ep_runtime * total_eps))
+
+
+async def fetch_catalogue_metadata(tmdb_id: int, media_type: str) -> dict:
+    if not settings.TMDB_API_KEY:
+        return {}
+    kind = "movie" if media_type == "movie" else "tv"
+    url = f"https://api.themoviedb.org/3/{kind}/{tmdb_id}"
+    response = await get_shared_client().get(url, params={"api_key": settings.TMDB_API_KEY})
+    if response.status_code != 200:
+        return {}
+    details = response.json()
+    poster_path = details.get("poster_path")
+    return {
+        "coverUrl": f"https://image.tmdb.org/t/p/w780{poster_path}" if poster_path else None,
+        "genres": [genre["name"] for genre in details.get("genres", [])],
+        "description": details.get("overview"),
+        "runtime": details.get("runtime") if kind == "movie" else _total_tv_runtime(details),
+    }
 
 
 async def fetch_anime_runtime(title: str) -> Optional[int]:

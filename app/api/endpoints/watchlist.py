@@ -1,14 +1,14 @@
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.api import dependencies
 from app.db import models
 from app.schemas import watchlist as watchlist_schema
 from app.api.endpoints.media import get_cached, enrich_media_cache
-from app.services.media_service import get_cached_bulk
+from app.services.media_service import fetch_catalogue_metadata, get_cached_bulk
 from app.db.database import AsyncSessionLocal
 import uuid
 import logging
@@ -17,40 +17,44 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-async def _background_enrich(title: str, media_type: str, year: int | None, item_id: str):
-    """Background task: enrich MediaCache and backfill the WatchlistItem."""
+METADATA_FIELDS = ("coverUrl", "genres", "runtime", "description")
+
+
+async def _background_enrich(
+    title: str, media_type: str, year: int | None, item_id: str, tmdb_id: int | None = None,
+):
+    """Fill missing metadata and keep it tied to the saved edition."""
     async with AsyncSessionLocal() as db:
         try:
-            await enrich_media_cache(db, title, media_type, year)
+            if tmdb_id is not None:
+                metadata = await fetch_catalogue_metadata(tmdb_id, media_type)
+            else:
+                await enrich_media_cache(db, title, media_type, year)
+                cached = await get_cached(db, title, media_type, year)
+                metadata = {field: getattr(cached, field) for field in METADATA_FIELDS} if cached else {}
 
-            # Backfill the watchlist item from the cache
-            cached = await get_cached(db, title, media_type, year)
-            if cached:
-                result = await db.execute(
-                    select(models.WatchlistItem).filter(models.WatchlistItem.id == item_id)
-                )
-                item = result.scalars().first()
-                if not item:
-                    return  # Item deleted before enrichment completed
-                changed = False
-                if not item.coverUrl and cached.coverUrl:
-                    item.coverUrl = cached.coverUrl
-                    changed = True
-                if (not item.genres or len(item.genres) == 0) and cached.genres and len(cached.genres) > 0:
-                    item.genres = cached.genres
-                    changed = True
-                if item.runtime is None and cached.runtime is not None:
-                    item.runtime = cached.runtime
-                    changed = True
-                if not item.description and cached.description:
-                    item.description = cached.description
-                    changed = True
-                if changed:
-                    await db.commit()
-                    logger.info(f"Background enriched watchlist item '{title}' from cache")
-        except Exception:
+            if not metadata:
+                return
+            item = await db.get(models.WatchlistItem, item_id)
+            if not item or (tmdb_id is None and (item.title != title or item.year != year)):
+                return
+
+            changes = {
+                field: value for field, value in metadata.items()
+                if value is not None and metadata_missing(field, getattr(item, field))
+            }
+            for field, value in changes.items():
+                setattr(item, field, value)
+            if changes:
+                await db.commit()
+                logger.info("Enriched watchlist item %s", item_id)
+        except Exception as exc:
             await db.rollback()
-            logger.exception(f"Background enrichment failed for '{title}'")
+            logger.warning("Metadata enrichment failed for %s: %s", item_id, exc.__class__.__name__)
+
+
+def metadata_missing(field: str, value: object) -> bool:
+    return value is None if field == "runtime" else not value
 
 
 @router.get("", response_model=watchlist_schema.WatchlistPage)
@@ -74,7 +78,7 @@ async def get_watchlist(
     q = (
         select(models.WatchlistItem)
         .filter(models.WatchlistItem.userId == current_user.id)
-        .order_by(models.WatchlistItem.updatedAt.desc())
+        .order_by(models.WatchlistItem.updatedAt.desc(), models.WatchlistItem.id)
     )
     if offset > 0:
         q = q.offset(offset)
@@ -99,30 +103,10 @@ async def create_watchlist_item(
     current_user: models.User = Depends(dependencies.get_current_user),
     db: AsyncSession = Depends(dependencies.get_db)
 ):
-    # check for uniqueness
-    res = await db.execute(select(models.WatchlistItem).filter(
-        models.WatchlistItem.userId == current_user.id,
-        models.WatchlistItem.title == item_in.title,
-        models.WatchlistItem.mediaType == item_in.mediaType
-    ))
-    existing = res.scalars().first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Item already exists in your watchlist")
-
-    # Check the global cache for pre-existing metadata
-    cached = await get_cached(db, item_in.title, item_in.mediaType, item_in.year)
-    item_data = item_in.model_dump()
-
-    # Auto-populate from cache if available
-    if cached:
-        if not item_data.get("coverUrl") and cached.coverUrl:
-            item_data["coverUrl"] = cached.coverUrl
-        if (not item_data.get("genres") or len(item_data["genres"]) == 0) and cached.genres:
-            item_data["genres"] = cached.genres
-        if item_data.get("runtime") is None and cached.runtime is not None:
-            item_data["runtime"] = cached.runtime
-        if not item_data.get("description") and cached.description:
-            item_data["description"] = cached.description
+    cached = None
+    if item_in.tmdbId is None:
+        cached = await get_cached(db, item_in.title, item_in.mediaType, item_in.year)
+    item_data = with_cached_metadata(item_in, cached)
 
     db_item = models.WatchlistItem(
         id=str(uuid.uuid4()),
@@ -133,20 +117,26 @@ async def create_watchlist_item(
     try:
         await db.commit()
     except IntegrityError:
-        # Two concurrent requests can both pass the SELECT above and race to
-        # INSERT. The unique constraint is the real arbiter; surface it as the
-        # documented 400 rather than letting it bubble up as a 500.
+        # The identity index also handles simultaneous additions.
         await db.rollback()
         raise HTTPException(status_code=400, detail="Item already exists in your watchlist")
     await db.refresh(db_item)
 
-    # Trigger background enrichment (fetches missing poster/runtime from external APIs)
-    background_tasks.add_task(
-        _background_enrich, item_in.title, item_in.mediaType, item_in.year, db_item.id
-    )
-
+    if any(metadata_missing(field, item_data[field]) for field in METADATA_FIELDS):
+        background_tasks.add_task(
+            _background_enrich, item_in.title, item_in.mediaType, item_in.year, db_item.id, item_in.tmdbId
+        )
     return db_item
 
+
+def with_cached_metadata(item: watchlist_schema.WatchlistItemCreate, cached: models.MediaCache | None) -> dict:
+    data = item.model_dump()
+    if cached:
+        for field in METADATA_FIELDS:
+            value = getattr(cached, field)
+            if metadata_missing(field, data[field]) and value is not None:
+                data[field] = value
+    return data
 
 
 MAX_BATCH_SIZE = 100
@@ -159,87 +149,56 @@ async def batch_import_items(
     current_user: models.User = Depends(dependencies.get_current_user),
     db: AsyncSession = Depends(dependencies.get_db)
 ):
-    """Import multiple items at once. Skips duplicates silently."""
+    """Import a batch and return a result for each submitted row."""
     if len(items) > MAX_BATCH_SIZE:
         raise HTTPException(
             status_code=413,
             detail=f"Batch size {len(items)} exceeds maximum of {MAX_BATCH_SIZE}"
         )
-    skipped = 0
-
-    # Existing titles for this user, projected rather than hydrated: only the
-    # title and type are needed to build the duplicate set.
-    result = await db.execute(
-        select(
-            func.lower(models.WatchlistItem.title), models.WatchlistItem.mediaType
-        ).filter(models.WatchlistItem.userId == current_user.id)
+    manual = [(item.title, item.mediaType, item.year) for item in items if item.tmdbId is None]
+    linked = {item.tmdbId for item in items if item.tmdbId is not None}
+    entry = models.WatchlistItem
+    existing = await db.execute(
+        select(func.lower(entry.title), entry.mediaType, entry.year, entry.tmdbId)
+        .where(entry.userId == current_user.id, or_(
+            entry.tmdbId.in_(linked),
+            entry.tmdbId.is_(None) & func.lower(entry.title).in_({title.lower() for title, _, _ in manual}),
+        ))
     )
-    existing_set = {(title, media_type) for title, media_type in result.all()}
-
-    # One cache lookup for the whole batch instead of one per item.
-    cache_by_key = await get_cached_bulk(
-        db, [(i.title, i.mediaType, i.year) for i in items]
-    )
-
+    keys = {
+        (kind, provider_id) if provider_id is not None else (kind, title, year)
+        for title, kind, year, provider_id in existing
+    }
+    cache = await get_cached_bulk(db, manual)
     rows: list[dict] = []
-    pending: dict[str, tuple[str, str, int | None]] = {}
+    pending: dict[str, tuple[int, watchlist_schema.WatchlistItemCreate]] = {}
+    results = ["duplicate"] * len(items)
 
-    for item_in in items:
-        # Case-insensitive pre-filter for a friendlier `skipped` count. The
-        # database constraint is case-sensitive, so ON CONFLICT below remains
-        # the actual arbiter.
-        key = (item_in.title.lower(), item_in.mediaType)
-        if key in existing_set:
-            skipped += 1
-            continue
-
-        cached = cache_by_key.get((item_in.title, item_in.mediaType, item_in.year))
-        item_data = item_in.model_dump()
-
-        # Auto-populate from cache if available
-        if cached:
-            if not item_data.get("coverUrl") and cached.coverUrl:
-                item_data["coverUrl"] = cached.coverUrl
-            if (not item_data.get("genres") or len(item_data["genres"]) == 0) and cached.genres:
-                item_data["genres"] = cached.genres
-            if item_data.get("runtime") is None and cached.runtime is not None:
-                item_data["runtime"] = cached.runtime
-            if not item_data.get("description") and cached.description:
-                item_data["description"] = cached.description
-
-        item_id = str(uuid.uuid4())
-        rows.append({"id": item_id, "userId": current_user.id, **item_data})
-        pending[item_id] = (item_in.title, item_in.mediaType, item_in.year)
-        existing_set.add(key)  # Prevent duplicates within the batch
-
-    imported = 0
-    inserted_ids: list[str] = []
-
-    if rows:
-        # ON CONFLICT DO NOTHING: a title that collides with an existing row
-        # (including one differing only by case) is skipped instead of aborting
-        # the whole batch with an IntegrityError.
-        stmt = (
-            pg_insert(models.WatchlistItem)
-            .values(rows)
-            .on_conflict_do_nothing(
-                constraint="watchlistitem_userid_title_mediatype_key"
-            )
-            .returning(models.WatchlistItem.id)
+    for index, item in enumerate(items):
+        key = (item.mediaType, item.tmdbId) if item.tmdbId is not None else (
+            item.mediaType, item.title.lower(), item.year
         )
-        inserted_ids = list((await db.execute(stmt)).scalars().all())
+        if key in keys:
+            continue
+        keys.add(key)
+        item_id = str(uuid.uuid4())
+        item_data = with_cached_metadata(item, cache.get((item.title, item.mediaType, item.year)) if item.tmdbId is None else None)
+        rows.append({"id": item_id, "userId": current_user.id, **item_data})
+        pending[item_id] = (index, item)
+
+    inserted_ids = []
+    if rows:
+        stmt = pg_insert(entry).values(rows).on_conflict_do_nothing().returning(entry.id)
+        inserted_ids = list((await db.execute(stmt)).scalars())
         await db.commit()
-        imported = len(inserted_ids)
-        skipped += len(rows) - imported
 
-    # Queue enrichment only after the commit succeeds, and only for rows that
-    # actually landed — previously tasks were queued for rows that a failed
-    # commit never created.
     for item_id in inserted_ids:
-        title, media_type, year = pending[item_id]
-        background_tasks.add_task(_background_enrich, title, media_type, year, item_id)
-
-    return {"success": True, "imported": imported, "skipped": skipped}
+        index, item = pending[item_id]
+        results[index] = "imported"
+        if item.tmdbId is None and not item.coverUrl:
+            background_tasks.add_task(_background_enrich, item.title, item.mediaType, item.year, item_id)
+    imported = len(inserted_ids)
+    return {"success": True, "imported": imported, "skipped": len(items) - imported, "results": results}
 
 
 @router.patch(
@@ -271,7 +230,7 @@ async def toggle_favorite(
 # the model at all (poster_path, rating, tags, priority, watched_at, …), which
 # implied a schema that was never real.
 ALLOWED_UPDATE_FIELDS = {
-    "status", "favorite", "genres", "notes", "description",
+    "title", "status", "favorite", "genres", "notes", "description",
     "year", "endYear", "running", "coverUrl", "runtime",
 }
 
@@ -292,7 +251,11 @@ async def update_watchlist_item(
         if field in ALLOWED_UPDATE_FIELDS:
             setattr(db_item, field, value)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="Item already exists in your watchlist")
     await db.refresh(db_item)
     return db_item
 

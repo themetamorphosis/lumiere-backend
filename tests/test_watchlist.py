@@ -156,10 +156,11 @@ async def test_delete_item_not_found(client: AsyncClient, auth_headers):
 @pytest.mark.asyncio
 async def test_create_duplicate_item(client: AsyncClient, auth_headers):
     title = f"Duplicate {uuid.uuid4().hex[:6]}"
-    await _create_item(client, auth_headers, title=title, mediaType="movie")
+    await _create_item(client, auth_headers, title=title, mediaType="movie", year=2000)
     res = await client.post("/api/v1/watchlist", json={
         "title": title,
         "mediaType": "movie",
         "status": "pending",
+        "year": 2000,
     }, headers=auth_headers)
     assert res.status_code == 400

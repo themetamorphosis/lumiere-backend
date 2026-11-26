@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Boolean, Integer, DateTime, ForeignKey, UniqueConstraint, Index
+from sqlalchemy import BigInteger, Column, text, String, Boolean, Integer, DateTime, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.sql import func
@@ -19,6 +19,9 @@ class User(Base):
     image = Column(String, nullable=True)
     password = Column(String, nullable=True) # hashed via bcryptjs
     token_family = Column(String, index=True, nullable=True)
+    auth_version = Column(String, nullable=True)
+    reset_token_digest = Column(String(64), unique=True, index=True, nullable=True)
+    reset_token_expires_at = Column(DateTime(timezone=True), nullable=True)
 
     createdAt = Column(DateTime(timezone=True), server_default=func.now())
     updatedAt = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
@@ -34,6 +37,7 @@ class WatchlistItem(Base):
 
     title = Column(String, nullable=False)
     mediaType = Column(String, nullable=False) # "movie" | "tv" | "anime"
+    tmdbId = Column(BigInteger, nullable=True)
     status = Column(String, nullable=False) # "watched" | "pending" | "wishlist"
     favorite = Column(Boolean, default=False)
 
@@ -54,7 +58,11 @@ class WatchlistItem(Base):
     updatedAt = Column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
     __table_args__ = (
-        UniqueConstraint('userId', 'title', 'mediaType', name='watchlistitem_userid_title_mediatype_key'),
+        Index("ix_watchlistitem_catalogue_identity", "userId", "mediaType", "tmdbId", unique=True),
+        Index(
+            "ix_watchlistitem_manual_identity", "userId", "mediaType", "title", "year",
+            unique=True, postgresql_where=text('"tmdbId" IS NULL'), postgresql_nulls_not_distinct=True,
+        ),
         Index('ix_watchlistitem_status', 'status'),
         Index('ix_watchlistitem_mediatype', 'mediaType'),
         # Matches the ORDER BY in GET /watchlist, which reads one user's rows

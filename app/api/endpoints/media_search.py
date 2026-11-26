@@ -5,10 +5,12 @@ custom discovery, and cache-first poster/runtime lookups.
 All business logic delegates to app.services.media_service.
 """
 
-from fastapi import APIRouter, Query, Depends
+from fastapi import APIRouter, Query, Depends, HTTPException
 from typing import Optional
 import logging
 import urllib.parse
+
+import httpx
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -73,14 +75,32 @@ async def get_runtime(
 #  TMDB SEARCH (autocomplete)
 # ═══════════════════════════════════════════════════════════════
 
+def catalogue_credentials_error() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={"code": "tmdb_credentials_required", "message": "A valid TMDB API key is required."},
+    )
+
+
+def require_catalogue_key() -> None:
+    if settings.TMDB_API_KEY.strip() in ("", "local-development-placeholder", "your_tmdb_api_key_here"):
+        raise catalogue_credentials_error()
+
+
+def read_catalogue_results(response: httpx.Response) -> list[dict]:
+    if response.status_code in (401, 403):
+        raise catalogue_credentials_error()
+    response.raise_for_status()
+    return response.json()["results"]
+
+
 @router.get("/search", response_model=TMDBSearchResponse)
 async def search_tmdb(
     query: str = Query(..., min_length=1, max_length=200),
     type: str = Query("movie", pattern="^(movie|tv|anime)$"),
 ):
     """Search TMDB for movies or TV shows. Returns up to 8 results for autocomplete."""
-    if not settings.TMDB_API_KEY:
-        return TMDBSearchResponse(results=[])
+    require_catalogue_key()
 
     cache_key = f"{type}:{query.strip().lower()}"
     cached = cache_get(cache_key)
@@ -101,11 +121,7 @@ async def search_tmdb(
     try:
         client = get_shared_client()
         r = await client.get(url)
-        if r.status_code != 200:
-            logger.warning(f"TMDB search failed ({r.status_code}) for query='{query}'")
-            return TMDBSearchResponse(results=[])
-
-        raw_results = r.json().get("results", [])
+        raw_results = read_catalogue_results(r)
 
         # For anime, filter to animation genre (id=16)
         if type == "anime":
@@ -144,9 +160,11 @@ async def search_tmdb(
         cache_set(cache_key, results)
         return TMDBSearchResponse(results=results)
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"TMDB search error for query='{query}': {e}")
-        return TMDBSearchResponse(results=[])
+        logger.warning("TMDB search failed: %s", e.__class__.__name__)
+        raise HTTPException(status_code=503, detail="The title catalogue is temporarily unavailable")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -159,8 +177,7 @@ async def get_trending(
     time_window: str = Query("day", pattern="^(day|week)$"),
 ):
     """Get trending media from TMDB."""
-    if not settings.TMDB_API_KEY:
-        return TMDBSearchResponse(results=[])
+    require_catalogue_key()
 
     cache_key = f"trending:{type}:{time_window}"
     cached = cache_get(cache_key)
@@ -168,8 +185,6 @@ async def get_trending(
         return TMDBSearchResponse(results=cached)
 
     client = get_shared_client()
-    results = []
-
     try:
         if type == "anime":
             url = (
@@ -183,18 +198,19 @@ async def get_trending(
             url = f"https://api.themoviedb.org/3/trending/{tmdb_type}/{time_window}?api_key={settings.TMDB_API_KEY}"
 
         r = await client.get(url)
-        if r.status_code == 200:
-            raw_results = r.json().get("results", [])
-            genre_map = TMDB_TV_GENRES if type in ("tv", "anime") else TMDB_GENRES
-            results = parse_tmdb_results(raw_results, type, genre_map)
+        raw_results = read_catalogue_results(r)
+        genre_map = TMDB_TV_GENRES if type in ("tv", "anime") else TMDB_GENRES
+        results = parse_tmdb_results(raw_results, type, genre_map)
 
         if results:
             cache_set(cache_key, results)
         return TMDBSearchResponse(results=results)
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Trending fetch error: {e}")
-        return TMDBSearchResponse(results=[])
+        logger.warning("Trending fetch failed: %s", e.__class__.__name__)
+        raise HTTPException(status_code=503, detail="The title catalogue is temporarily unavailable") from None
 
 
 @router.get("/popular", response_model=TMDBSearchResponse)
@@ -203,8 +219,7 @@ async def get_popular(
     page: int = Query(1, ge=1, le=500),
 ):
     """Get popular media from TMDB."""
-    if not settings.TMDB_API_KEY:
-        return TMDBSearchResponse(results=[])
+    require_catalogue_key()
 
     cache_key = f"popular:{type}:{page}"
     cached = cache_get(cache_key)
@@ -212,8 +227,6 @@ async def get_popular(
         return TMDBSearchResponse(results=cached)
 
     client = get_shared_client()
-    results = []
-
     try:
         if type == "anime":
             url = (
@@ -227,18 +240,19 @@ async def get_popular(
             url = f"https://api.themoviedb.org/3/{tmdb_type}/popular?api_key={settings.TMDB_API_KEY}&page={page}"
 
         r = await client.get(url)
-        if r.status_code == 200:
-            raw_results = r.json().get("results", [])
-            genre_map = TMDB_TV_GENRES if type in ("tv", "anime") else TMDB_GENRES
-            results = parse_tmdb_results(raw_results, type, genre_map)
+        raw_results = read_catalogue_results(r)
+        genre_map = TMDB_TV_GENRES if type in ("tv", "anime") else TMDB_GENRES
+        results = parse_tmdb_results(raw_results, type, genre_map)
 
         if results:
             cache_set(cache_key, results)
         return TMDBSearchResponse(results=results)
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Popular fetch error: {e}")
-        return TMDBSearchResponse(results=[])
+        logger.warning("Popular fetch failed: %s", e.__class__.__name__)
+        raise HTTPException(status_code=503, detail="The title catalogue is temporarily unavailable") from None
 
 
 @router.get("/top-rated", response_model=TMDBSearchResponse)
@@ -247,8 +261,7 @@ async def get_top_rated(
     page: int = Query(1, ge=1, le=500),
 ):
     """Get top-rated media from TMDB."""
-    if not settings.TMDB_API_KEY:
-        return TMDBSearchResponse(results=[])
+    require_catalogue_key()
 
     cache_key = f"top-rated:{type}:{page}"
     cached = cache_get(cache_key)
@@ -256,8 +269,6 @@ async def get_top_rated(
         return TMDBSearchResponse(results=cached)
 
     client = get_shared_client()
-    results = []
-
     try:
         if type == "anime":
             url = (
@@ -271,18 +282,19 @@ async def get_top_rated(
             url = f"https://api.themoviedb.org/3/{tmdb_type}/top_rated?api_key={settings.TMDB_API_KEY}&page={page}"
 
         r = await client.get(url)
-        if r.status_code == 200:
-            raw_results = r.json().get("results", [])
-            genre_map = TMDB_TV_GENRES if type in ("tv", "anime") else TMDB_GENRES
-            results = parse_tmdb_results(raw_results, type, genre_map)
+        raw_results = read_catalogue_results(r)
+        genre_map = TMDB_TV_GENRES if type in ("tv", "anime") else TMDB_GENRES
+        results = parse_tmdb_results(raw_results, type, genre_map)
 
         if results:
             cache_set(cache_key, results)
         return TMDBSearchResponse(results=results)
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Top-rated fetch error: {e}")
-        return TMDBSearchResponse(results=[])
+        logger.warning("Top-rated fetch failed: %s", e.__class__.__name__)
+        raise HTTPException(status_code=503, detail="The title catalogue is temporarily unavailable") from None
 
 
 @router.get("/discover", response_model=TMDBSearchResponse)
@@ -300,8 +312,7 @@ async def discover_media(
     page: int = Query(1, ge=1, le=500),
 ):
     """Discover media with advanced filters."""
-    if not settings.TMDB_API_KEY:
-        return TMDBSearchResponse(results=[])
+    require_catalogue_key()
 
     cache_key = f"discover:{type}:{genre}:{year}:{decade}:{sort_by}:{page}"
     cached = cache_get(cache_key)
@@ -348,16 +359,17 @@ async def discover_media(
 
     try:
         r = await client.get(url)
-        if r.status_code == 200:
-            raw_results = r.json().get("results", [])
-            results = parse_tmdb_results(raw_results, type, genre_map)
+        raw_results = read_catalogue_results(r)
+        results = parse_tmdb_results(raw_results, type, genre_map)
 
         if results:
             cache_set(cache_key, results)
         return TMDBSearchResponse(results=results)
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Discover fetch error: {e}")
-        return TMDBSearchResponse(results=[])
+        logger.warning("Discover fetch failed: %s", e.__class__.__name__)
+        raise HTTPException(status_code=503, detail="The title catalogue is temporarily unavailable")
 
 

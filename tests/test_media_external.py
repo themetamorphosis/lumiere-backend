@@ -329,11 +329,10 @@ async def test_search_endpoint_url_encodes_query(client):
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_search_endpoint_degrades_to_empty_on_upstream_error(client):
+async def test_search_endpoint_reports_upstream_error(client):
     respx.get(f"{TMDB}/search/movie").mock(return_value=httpx.Response(500))
     res = await client.get("/api/v1/media/search?query=boom&type=movie")
-    assert res.status_code == 200
-    assert res.json()["results"] == []
+    assert res.status_code == 503
 
 
 @respx.mock
@@ -341,8 +340,7 @@ async def test_search_endpoint_degrades_to_empty_on_upstream_error(client):
 async def test_search_endpoint_survives_network_failure(client):
     respx.get(f"{TMDB}/search/movie").mock(side_effect=httpx.ConnectError("down"))
     res = await client.get("/api/v1/media/search?query=offline&type=movie")
-    assert res.status_code == 200
-    assert res.json()["results"] == []
+    assert res.status_code == 503
 
 
 @respx.mock
@@ -452,8 +450,7 @@ async def test_discover_expands_decade_into_date_range(client):
 async def test_discover_degrades_on_error(client):
     respx.get(f"{TMDB}/discover/movie").mock(side_effect=httpx.ConnectError("down"))
     res = await client.get("/api/v1/media/discover?type=movie")
-    assert res.status_code == 200
-    assert res.json()["results"] == []
+    assert res.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -578,3 +575,40 @@ async def test_details_tolerates_missing_credits_and_videos(client):
     assert data["cast"] == []
     assert data["trailerKey"] is None
     assert data["runtime"] == 45
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", [
+    "search?query=missing-provider", "trending", "popular", "top-rated", "discover",
+])
+async def test_catalogue_reports_missing_provider(client, monkeypatch, path):
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "TMDB_API_KEY", "")
+    response = await client.get(f"/api/v1/media/{path}")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "tmdb_credentials_required"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_search_reports_rejected_provider_credentials(client):
+    respx.get(f"{TMDB}/search/movie").mock(return_value=httpx.Response(401))
+    response = await client.get("/api/v1/media/search?query=wrong-key")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "tmdb_credentials_required"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_catalogue_enrichment_looks_up_the_exact_id():
+    from app.services.media_service import fetch_catalogue_metadata
+
+    respx.get(f"{TMDB}/movie/438631").mock(return_value=httpx.Response(200, json={
+        "runtime": 155,
+        "overview": "The 2021 edition",
+        "genres": [{"name": "Science Fiction"}],
+    }))
+    data = await fetch_catalogue_metadata(438631, "movie")
+    assert data["runtime"] == 155
+    assert data["description"] == "The 2021 edition"

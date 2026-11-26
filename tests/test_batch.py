@@ -67,3 +67,29 @@ async def test_batch_import_no_auth(client: AsyncClient):
     items = [{"title": "No Auth", "mediaType": "movie", "status": "pending"}]
     res = await client.post("/api/v1/watchlist/batch", json=items)
     assert res.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_import_distinguishes_editions_and_returns_a_result_for_each_row(client, auth_headers):
+    endpoint = "/api/v1/watchlist"
+    film = {"title": "Dune", "mediaType": "movie", "status": "watched", "favorite": True}
+    response = await client.post(f"{endpoint}/batch", headers=auth_headers, json=[
+        {**film, "year": 1984},
+        {**film, "year": 2021},
+        {**film, "title": "dune", "year": 2021},
+        {**film, "tmdbId": 438631, "year": 2021},
+        {**film, "tmdbId": 438631, "title": "Dune: Part One", "year": 2020},
+    ])
+    assert response.status_code == 200
+    assert response.json()["results"] == ["imported", "imported", "duplicate", "imported", "duplicate"]
+
+    page = (await client.get(endpoint, headers=auth_headers)).json()
+    assert page["total"] == 3
+    linked = next(item for item in page["items"] if item["tmdbId"] == 438631)
+    assert linked["year"] == 2021
+    response = await client.patch(
+        f"{endpoint}/{linked['id']}", headers=auth_headers, json={"title": "Dune: Part One"}
+    )
+    assert response.status_code == 200
+    assert response.json()["title"] == "Dune: Part One"
+    assert response.json()["tmdbId"] == 438631

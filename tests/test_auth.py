@@ -125,3 +125,49 @@ async def test_update_me_password(client: AsyncClient, test_user, auth_headers):
         "password": "NewSecure123!",
     })
     assert login_res.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_register_and_sign_in_with_mixed_case_email(client: AsyncClient):
+    email = f"Mixed-{uuid.uuid4().hex[:8]}@EXAMPLE.COM"
+    password = "SecurePass123!"
+    body = {"email": email, "name": "New User", "password": password}
+    registered = await client.post("/api/v1/auth/register?create_session=true", json=body)
+    assert registered.status_code == 200
+    assert registered.headers["cache-control"] == "no-store"
+    data = registered.json()
+    assert data["user"]["email"] == email.lower()
+    assert "refresh_token" in data["session"]
+
+    me = await client.get("/api/v1/auth/me", headers={
+        "Authorization": f"Bearer {data['session']['access_token']}",
+    })
+    assert me.status_code == 200
+    assert me.json()["id"] == data["user"]["id"]
+
+    signed_in = await client.post("/api/v1/auth/login", data={
+        "username": f" {email.upper()} ", "password": password,
+    })
+    assert signed_in.status_code == 200
+    duplicate = await client.post("/api/v1/auth/register", json={**body, "email": email.upper()})
+    assert duplicate.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_case_insensitive_login_and_registration_check_existing_accounts(client, db, test_user):
+    legacy_email = test_user.email.upper().replace("@EXAMPLE.COM", "@example.com")
+    test_user.email = legacy_email
+    await db.commit()
+
+    signed_in = await client.post("/api/v1/auth/login", data={
+        "username": legacy_email.lower(), "password": "TestPass123!",
+    })
+    assert signed_in.status_code == 200
+    me = await client.get("/api/v1/auth/me", headers={
+        "Authorization": f"Bearer {signed_in.json()['access_token']}",
+    })
+    assert me.json()["id"] == test_user.id
+    duplicate = await client.post("/api/v1/auth/register", json={
+        "email": legacy_email.lower(), "name": "Duplicate", "password": "SecurePass123!",
+    })
+    assert duplicate.status_code == 400

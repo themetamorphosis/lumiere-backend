@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Literal
 from datetime import datetime
 
@@ -9,6 +9,7 @@ StatusType = Literal["watched", "pending", "wishlist"]
 class WatchlistItemBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
     mediaType: MediaType
+    tmdbId: Optional[int] = Field(None, gt=0, le=9007199254740991)
     status: StatusType
     favorite: Optional[bool] = False
     genres: Optional[List[str]] = []
@@ -26,6 +27,14 @@ class WatchlistItemCreate(WatchlistItemBase):
 
 
 class WatchlistItemUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+
+    @field_validator("title")
+    @classmethod
+    def title_cannot_be_null(cls, title: Optional[str]) -> str:
+        if title is None:
+            raise ValueError("Title is required")
+        return title
     status: Optional[StatusType] = None
     favorite: Optional[bool] = None
     genres: Optional[List[str]] = None
@@ -66,6 +75,7 @@ class BatchImportResult(BaseModel):
     success: bool
     imported: int
     skipped: int
+    results: List[Literal["imported", "duplicate"]]
 
 
 class FavoriteToggleResult(BaseModel):

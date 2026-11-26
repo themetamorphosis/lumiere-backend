@@ -134,7 +134,9 @@ async def test_batch_imports_all_new_items(client, auth_headers):
         headers=auth_headers,
     )
     assert res.status_code == 200
-    assert res.json() == {"success": True, "imported": 3, "skipped": 0}
+    assert res.json() == {
+        "success": True, "imported": 3, "skipped": 0, "results": ["imported"] * 3,
+    }
 
 
 @pytest.mark.asyncio

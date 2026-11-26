@@ -1,5 +1,5 @@
 import re
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator
 from typing import Optional
 from datetime import datetime
 
@@ -44,7 +44,7 @@ def validate_handle(v: str) -> str:
     return handle
 
 
-def _validate_password(v: str) -> str:
+def validate_password(v: str) -> str:
     if len(v.encode("utf-8")) > MAX_PASSWORD_BYTES:
         raise ValueError(
             f"Password must be at most {MAX_PASSWORD_BYTES} bytes "
@@ -70,7 +70,7 @@ class UserCreate(UserBase):
     @field_validator("password")
     @classmethod
     def password_complexity(cls, v: str) -> str:
-        return _validate_password(v)
+        return validate_password(v)
 
 
 class UserUpdate(BaseModel):
@@ -87,7 +87,7 @@ class UserUpdate(BaseModel):
     def password_complexity(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return v
-        return _validate_password(v)
+        return validate_password(v)
 
     @field_validator("handle")
     @classmethod
@@ -111,9 +111,23 @@ class Token(BaseModel):
     token_type: str
 
 
+class RegistrationSession(BaseModel):
+    user: User
+    session: Token
+
+
 class TokenRefresh(BaseModel):
     refresh_token: str
 
 
 class TokenData(BaseModel):
     email: Optional[str] = None
+
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirmation(BaseModel):
+    token: SecretStr
+    password: SecretStr
